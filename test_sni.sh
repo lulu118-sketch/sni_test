@@ -15,7 +15,11 @@
 #        |
 #   TOP12
 #        |
-#   Precision 100 rounds
+#   Stage 1 precision: 30 rounds
+#        |
+#   Rank TOP5 finalists
+#        |
+#   Stage 2 final validation: 100 rounds
 #        |
 #   P50 / P75 / P90 / P95 / P99
 #        |
@@ -83,7 +87,9 @@ FAST_TIMEOUT=3
 # ------------------------------------------------------------
 
 PRECISION_TOP=12
-PRECISION_ROUNDS=100
+PRECISION_ROUNDS=30
+FINAL_TOP=5
+FINAL_ROUNDS=100
 PRECISION_CONC=3
 PRECISION_TIMEOUT=5
 
@@ -358,6 +364,10 @@ FAST_RANKING="$RESULT_DIR/fast_ranking.txt"
 FAST_RESULT="$RESULT_DIR/fast_result.txt"
 
 TOP_FILE="$RESULT_DIR/top12.list"
+PRECISION30_RAW="$RESULT_DIR/precision30_raw.txt"
+PRECISION30_STATS="$RESULT_DIR/precision30_stats.txt"
+PRECISION30_RANKING="$RESULT_DIR/precision30_ranking.txt"
+FINAL_TOP_FILE="$RESULT_DIR/final_top5.list"
 
 PRECISION_RAW="$RESULT_DIR/precision_raw.txt"
 PRECISION_STATS="$RESULT_DIR/precision_stats.txt"
@@ -373,6 +383,10 @@ RECOMMENDED_LIST="$RESULT_DIR/recommended.list"
 : > "$FAST_RANKING"
 : > "$FAST_RESULT"
 : > "$TOP_FILE"
+: > "$PRECISION30_RAW"
+: > "$PRECISION30_STATS"
+: > "$PRECISION30_RANKING"
+: > "$FINAL_TOP_FILE"
 
 : > "$PRECISION_RAW"
 : > "$PRECISION_STATS"
@@ -572,7 +586,9 @@ echo "  Timeout        : ${FAST_TIMEOUT}s"
 echo
 echo "Precision"
 echo "  TOP            : $PRECISION_TOP"
-echo "  Rounds         : $PRECISION_ROUNDS"
+echo "  Rounds         : $PRECISION_ROUNDS (Stage 1)"
+echo "  Final TOP      : $FINAL_TOP"
+echo "  Final Rounds   : $FINAL_ROUNDS"
 echo "  Concurrency    : $PRECISION_CONC"
 echo "  Timeout        : ${PRECISION_TIMEOUT}s"
 
@@ -742,7 +758,7 @@ head -n "$PRECISION_TOP" \
 
 echo
 echo "============================================================"
-echo " PRECISION TOP$PRECISION_TOP"
+echo " PRECISION STAGE 1 TOP$PRECISION_TOP"
 echo "============================================================"
 echo
 
@@ -1110,231 +1126,309 @@ calc_verdict() {
 }
 
 # ============================================================
-# 21. Precision testing
+# 21. Precision stage runner
 # ============================================================
 
-echo "============================================================"
-echo " PRECISION TEST"
-echo "============================================================"
-echo
+run_precision_stage() {
 
-PRECISION_START="$(date +%s)"
+    local rounds="$1"
+    local input_file="$2"
+    local raw_file="$3"
+    local label="$4"
 
-: > "$PRECISION_RAW"
+    local stage_start
+    local stage_end
 
-while IFS= read -r domain; do
+    echo "============================================================"
+    echo " $label"
+    echo "============================================================"
+    echo
 
-    [[ -n "$domain" ]] || continue
+    stage_start="$(date +%s)"
 
-    echo "Testing: $domain"
+    : > "$raw_file"
 
-    for ((round=1; round<=PRECISION_ROUNDS; round++)); do
+    while IFS= read -r domain; do
 
-        printf '\r  Round %3d / %3d' \
-            "$round" \
-            "$PRECISION_ROUNDS"
+        [[ -n "$domain" ]] || continue
 
-        test_one \
+        echo "Testing: $domain"
+
+        for ((round=1; round<=rounds; round++)); do
+
+            printf '\r  Round %3d / %3d' \
+                "$round" \
+                "$rounds"
+
+            test_one \
+                "$domain" \
+                "$PRECISION_TIMEOUT" \
+                >> "$raw_file"
+
+            if (( round < rounds )); then
+
+                pause="$(
+                    random_range \
+                        "$ROUND_PAUSE_MIN" \
+                        "$ROUND_PAUSE_MAX"
+                )"
+
+                sleep "$pause"
+
+            fi
+
+            if (( round % BATCH_SIZE == 0 &&
+                  round < rounds ))
+            then
+
+                echo
+                echo "  Batch pause..."
+
+                pause="$(
+                    random_range \
+                        "$BATCH_PAUSE_MIN" \
+                        "$BATCH_PAUSE_MAX"
+                )"
+
+                sleep "$pause"
+
+            fi
+
+        done
+
+        echo
+        echo
+
+    done < "$input_file"
+
+    stage_end="$(date +%s)"
+
+    echo "$label completed."
+    echo "Elapsed: $((stage_end-stage_start)) seconds"
+    echo
+}
+
+# ============================================================
+# 22. Statistics / ranking helpers
+# ============================================================
+
+build_precision_stats() {
+
+    local raw_file="$1"
+    local list_file="$2"
+    local stats_file="$3"
+    local ranking_file="$4"
+
+    # Bash dynamic scoping makes this local value visible to
+    # percentile/calc_jitter/calc_risk below.
+    local PRECISION_RAW="$raw_file"
+
+    : > "$stats_file"
+    : > "$ranking_file"
+
+    while IFS= read -r domain; do
+
+        [[ -n "$domain" ]] || continue
+
+        total="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        success="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="OK"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        rate="$(
+            awk \
+                -v s="$success" \
+                -v t="$total" \
+                'BEGIN{
+                    if(t>0)
+                        printf "%.2f",s/t*100
+                    else
+                        print "0.00"
+                }'
+        )"
+
+        avg="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="OK"{sum+=$2;n++}
+                 END{
+                     if(n>0)
+                         printf "%.2f",sum/n
+                     else
+                         print 999999
+                 }' \
+                "$raw_file"
+        )"
+
+        p50="$(percentile "$domain" 50)"
+        p75="$(percentile "$domain" 75)"
+        p90="$(percentile "$domain" 90)"
+        p95="$(percentile "$domain" 95)"
+        p99="$(percentile "$domain" 99)"
+
+        jitter="$(calc_jitter "$domain")"
+
+        timeout_count="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="TIMEOUT"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        reset_count="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="RESET"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        tlsfail_count="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="TLS_FAIL"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        certfail_count="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="CERT_FAIL"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        connectfail_count="$(
+            awk -F'|' \
+                -v d="$domain" \
+                '$1==d && $3=="CONNECT_FAIL"{n++} END{print n+0}' \
+                "$raw_file"
+        )"
+
+        risk="$(calc_risk "$domain")"
+
+        score="$(
+            calc_score \
+                "$rate" \
+                "$p50" \
+                "$p95" \
+                "$p99" \
+                "$jitter" \
+                "$risk"
+        )"
+
+        verdict="$(
+            calc_verdict \
+                "$rate" \
+                "$p95" \
+                "$p99" \
+                "$risk"
+        )"
+
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
             "$domain" \
-            "$PRECISION_TIMEOUT" \
-            >> "$PRECISION_RAW"
-
-        if (( round < PRECISION_ROUNDS )); then
-
-            pause="$(
-                random_range \
-                    "$ROUND_PAUSE_MIN" \
-                    "$ROUND_PAUSE_MAX"
-            )"
-
-            sleep "$pause"
-
-        fi
-
-        if (( round % BATCH_SIZE == 0 &&
-              round < PRECISION_ROUNDS ))
-        then
-
-            echo
-            echo "  Batch pause..."
-
-            pause="$(
-                random_range \
-                    "$BATCH_PAUSE_MIN" \
-                    "$BATCH_PAUSE_MAX"
-            )"
-
-            sleep "$pause"
-
-        fi
-
-    done
-
-    echo
-    echo
-
-done < "$TOP_FILE"
-
-PRECISION_END="$(date +%s)"
-
-echo "Precision testing completed."
-echo "Elapsed: $((PRECISION_END-PRECISION_START)) seconds"
-echo
-
-# ============================================================
-# 22. Precision statistics
-#
-# Fields:
-#
-# 1  domain
-# 2  rate
-# 3  avg
-# 4  p50
-# 5  p75
-# 6  p90
-# 7  p95
-# 8  p99
-# 9  jitter
-# 10 timeout_count
-# 11 reset_count
-# 12 tlsfail_count
-# 13 certfail_count
-# 14 connectfail_count
-# 15 risk
-# 16 score
-# 17 verdict
-# ============================================================
-
-while IFS= read -r domain; do
-
-    [[ -n "$domain" ]] || continue
-
-    total="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    success="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="OK"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    rate="$(
-        awk \
-            -v s="$success" \
-            -v t="$total" \
-            'BEGIN{
-                if(t>0)
-                    printf "%.2f",s/t*100
-                else
-                    print "0.00"
-            }'
-    )"
-
-    avg="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="OK"{sum+=$2;n++}
-             END{
-                 if(n>0)
-                     printf "%.2f",sum/n
-                 else
-                     print 999999
-             }' \
-            "$PRECISION_RAW"
-    )"
-
-    p50="$(percentile "$domain" 50)"
-    p75="$(percentile "$domain" 75)"
-    p90="$(percentile "$domain" 90)"
-    p95="$(percentile "$domain" 95)"
-    p99="$(percentile "$domain" 99)"
-
-    jitter="$(calc_jitter "$domain")"
-
-    timeout_count="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="TIMEOUT"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    reset_count="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="RESET"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    tlsfail_count="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="TLS_FAIL"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    certfail_count="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="CERT_FAIL"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    connectfail_count="$(
-        awk -F'|' \
-            -v d="$domain" \
-            '$1==d && $3=="CONNECT_FAIL"{n++} END{print n+0}' \
-            "$PRECISION_RAW"
-    )"
-
-    risk="$(calc_risk "$domain")"
-
-    score="$(
-        calc_score \
             "$rate" \
+            "$avg" \
             "$p50" \
+            "$p75" \
+            "$p90" \
             "$p95" \
             "$p99" \
             "$jitter" \
-            "$risk"
-    )"
+            "$timeout_count" \
+            "$reset_count" \
+            "$tlsfail_count" \
+            "$certfail_count" \
+            "$connectfail_count" \
+            "$risk" \
+            "$score" \
+            "$verdict" \
+            >> "$stats_file"
 
-    verdict="$(
-        calc_verdict \
-            "$rate" \
-            "$p95" \
-            "$p99" \
-            "$risk"
-    )"
+    done < "$list_file"
 
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-        "$domain" \
-        "$rate" \
-        "$avg" \
-        "$p50" \
-        "$p75" \
-        "$p90" \
-        "$p95" \
-        "$p99" \
-        "$jitter" \
-        "$timeout_count" \
-        "$reset_count" \
-        "$tlsfail_count" \
-        "$certfail_count" \
-        "$connectfail_count" \
-        "$risk" \
-        "$score" \
-        "$verdict" \
-        >> "$PRECISION_STATS"
+    awk -F'|' '
+    {
+        if($17=="PASS") priority=1
+        else if($17=="WARN") priority=2
+        else priority=3
 
-done < "$TOP_FILE"
+        print priority "|" $0
+    }
+    ' "$stats_file" |
+    sort -t'|' -k1,1n -k17,17nr -k8,8n -k9,9n -k3,3nr |
+    cut -d'|' -f2- \
+    > "$ranking_file"
+}
 
 # ============================================================
-# 23. Correct final ranking
+# 23. Stage 1: TOP12 -> 30 rounds
+# ============================================================
+
+run_precision_stage \
+    "$PRECISION_ROUNDS" \
+    "$TOP_FILE" \
+    "$PRECISION30_RAW" \
+    "PRECISION STAGE 1 — TOP12 / 30 ROUNDS"
+
+build_precision_stats \
+    "$PRECISION30_RAW" \
+    "$TOP_FILE" \
+    "$PRECISION30_STATS" \
+    "$PRECISION30_RANKING"
+
+# Select only the strongest finalists for the expensive 100-round test.
+head -n "$FINAL_TOP" "$PRECISION30_RANKING" |
+    cut -d'|' -f1 \
+    > "$FINAL_TOP_FILE"
+
+echo "============================================================"
+echo " PRECISION STAGE 1 RESULT"
+echo "============================================================"
+echo
+
+printf "%-35s %7s %8s %7s %7s %7s %7s %7s %8s %7s %8s %8s\n" \
+    "SNI" "RATE" "AVG" "P50" "P75" "P90" "P95" "P99" "JITTER" "RISK" "SCORE" "STATUS"
+echo "----------------------------------------------------------------------------------------------------------------------------------"
+
+while IFS='|' read -r domain rate avg p50 p75 p90 p95 p99 jitter timeout_count reset_count tlsfail_count certfail_count connectfail_count risk score verdict; do
+    printf "%-35s %6s%% %8sms %7sms %7sms %7sms %7sms %7sms %8sms %7s %8s %8s\n" \
+        "$domain" "$rate" "$avg" "$p50" "$p75" "$p90" "$p95" "$p99" "$jitter" "$risk" "$score" "$verdict"
+done < "$PRECISION30_RANKING"
+
+echo
+echo "FINAL TOP$FINAL_TOP"
+nl -ba "$FINAL_TOP_FILE"
+echo
+
+# ============================================================
+# 24. Stage 2: finalists -> 100 rounds
+# ============================================================
+
+run_precision_stage \
+    "$FINAL_ROUNDS" \
+    "$FINAL_TOP_FILE" \
+    "$PRECISION_RAW" \
+    "FINAL VALIDATION — TOP$FINAL_TOP / 100 ROUNDS"
+
+build_precision_stats \
+    "$PRECISION_RAW" \
+    "$FINAL_TOP_FILE" \
+    "$PRECISION_STATS" \
+    "$PRECISION_RANKING"
+
+# ============================================================
+# 25. Correct final ranking
+# ============================================================
+
+
 #
 # Internal sort fields after adding priority:
 #
@@ -1396,7 +1490,7 @@ cut -d'|' -f2- \
 > "$PRECISION_RANKING"
 
 # ============================================================
-# 24. Final ranking display
+# 26. Final ranking display
 # ============================================================
 
 {
@@ -1463,7 +1557,7 @@ cut -d'|' -f2- \
 } | tee "$FINAL_RESULT"
 
 # ============================================================
-# 25. Recommendation
+# 27. Recommendation
 #
 # Only PASS entries are considered actual recommendations.
 #
@@ -1502,7 +1596,7 @@ if [[ -s "$PASS_FILE" ]]; then
 fi
 
 # ============================================================
-# 26. Human-readable recommendation
+# 28. Human-readable recommendation
 # ============================================================
 
 {
@@ -1640,7 +1734,7 @@ fi
 } | tee "$RECOMMEND"
 
 # ============================================================
-# 27. Machine-readable recommendation list
+# 29. Machine-readable recommendation list
 # ============================================================
 
 {
@@ -1651,12 +1745,15 @@ fi
 } > "$RECOMMENDED_LIST"
 
 # ============================================================
-# 28. Final summary
+# 30. Final summary
 # ============================================================
 
 FAST_REQUESTS="$(
     wc -l < "$FAST_RAW"
 )"
+
+PRECISION30_REQUESTS="$(wc -l < "$PRECISION30_RAW")"
+FINAL_REQUESTS="$(wc -l < "$PRECISION_RAW")"
 
 FAST_SUCCESS="$(
     awk -F'|' \
@@ -1664,15 +1761,14 @@ FAST_SUCCESS="$(
         "$FAST_RAW"
 )"
 
-PRECISION_REQUESTS="$(
-    wc -l < "$PRECISION_RAW"
-)"
+PRECISION_REQUESTS="$FINAL_REQUESTS"
 
 TOTAL_REQUESTS="$(
     awk \
         -v a="$FAST_REQUESTS" \
-        -v b="$PRECISION_REQUESTS" \
-        'BEGIN{print a+b}'
+        -v b="$PRECISION30_REQUESTS" \
+        -v c="$FINAL_REQUESTS" \
+        'BEGIN{print a+b+c}'
 )"
 
 PASS_COUNT="$(
@@ -1708,7 +1804,9 @@ echo "Fast Requests            : $FAST_REQUESTS"
 echo "Fast Successful          : $FAST_SUCCESS"
 
 echo
-echo "Precision Requests       : $PRECISION_REQUESTS"
+echo "Stage 1 Precision        : $PRECISION30_REQUESTS (30-round stage)"
+echo "Final Validation         : $FINAL_REQUESTS (100-round stage)"
+echo "Precision Total          : $PRECISION_REQUESTS"
 echo "Total Requests           : $TOTAL_REQUESTS"
 
 echo
